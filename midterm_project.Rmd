@@ -1,0 +1,340 @@
+---
+title: "mideterm_project"
+author: "jiaying Ning"
+date: "3/18/2021"
+output:
+  html_document:
+    df_print: paged
+---
+
+###### import package
+```{r, echo = T, message = FALSE, results='hide', warning=FALSE}
+#load package
+library(caret) 
+library(splines)
+library(mgcv)
+library(pdp)
+library(earth)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(AppliedPredictiveModeling)
+library(glmnet)
+library(corrplot)
+
+```
+
+###### Fit Data
+```{r}
+student_performance = read.csv("./data/student-mat.csv")
+
+```
+
+#### Process and Clean data
+
+Summary output
+```{r}
+summary(student_performance)
+```
+
+frequency table output
+```{r}
+knitr::kable(lapply(student_performance[,1:29], table))
+
+```
+
+spaghetti plot:
+
+```{r, include=FALSE}
+
+student_longititude = 
+  student_performance %>%
+  janitor::clean_names() %>%
+  na.omit() %>%
+  mutate(id = row_number()) %>%
+  pivot_longer(
+    g1:g3,
+    names_to = "exam_time", 
+    values_to = "exam_score") %>%
+  relocate(exam_time,exam_score,id)  %>%
+  mutate(exam_time = recode(exam_time, "g1" =  "time1", "g2" = "time2", "g3"="time3"))
+
+```
+
+
+```{r}
+student_longititude %>%
+  ggplot( aes(exam_time, exam_score, group=id)) + geom_line() +   labs(title = "spaghetti plot") 
+```
+filter out those who have 0 values in exam2 and exam3
+```{r}
+student_longititude %>% 
+  filter(exam_time != "time1" & exam_score == 0 )
+```
+
+  - A strange pattern I notice from the current data is that, there seems to be a group of students who continue to have 0 scores for both period2 and period3 exam, while there is a gap between scores 0 and 5. A potential explanation is that some students decide to drop the course after the first or second exam. 
+
+  - In this case I decide to keep these strange 0 values since I cannot make conclusion about what these 0 value truly mean. 
+
+
+#### create data frame that contain average score 
+```{r}
+
+student_avgexam = 
+  student_performance %>%
+  janitor::clean_names() %>%
+  na.omit() %>%
+  mutate(avgscore = (g1+g2+g3)/3)%>%
+  dplyr::select(-g1,-g2,-g3)
+
+```
+
+distribution of outcome:
+```{r}
+hist(student_avgexam$avgscore)
+
+```
+Since the outcome of interest is approximately normal, transformation is not required in this case.
+
+
+
+#### splitting the data into training and testing 
+```{r}
+
+
+rowTrain <- createDataPartition(y = student_avgexam$avgscore,
+                                p = 0.75,
+                                list = FALSE)
+training = student_avgexam[rowTrain,]
+testing = student_avgexam[-rowTrain,]
+
+training2 <- model.matrix(avgscore ~ ., training)[ ,-1]
+test2 = model.matrix(avgscore ~ ., testing)[ ,-1]
+y <- training$avgscore
+```
+
+#### Exploratory data analysis
+
+  1. correlation plot
+
+```{r}
+
+corrplot::corrplot(cor(training2), method = "circle", type = "full")
+```
+We can see that overall most predictors do not have strong correlation with other predictors, but some correlation does exist,for example: 
+
+  - medu and fedu seem to have positive correlation. 
+  - fjobservice and fjobother seem to have strong negative correlation, 
+  - freetime, goout, Dalc(workday alcohol consumption), Walc(weekend alcohol consumption) seems to be positively correlated.
+  
+Collinearity is a potential problem for models that have a relatively large number of predictors, and collinearity can lead to large variance. we may regularize the coefficient to control the variance by using ridge and lasso.
+
+
+  2. scatterplot
+  
+  
+```{r}
+library(caret) 
+library(splines)
+library(mgcv)
+library(pdp)
+library(earth)
+```
+  
+```{r}
+
+theme1 <- trellis.par.get()
+theme1$plot.symbol$col <- rgb(.2, .4, .2, .5)
+theme1$plot.symbol$pch <- 16
+theme1$plot.line$col <- rgb(.8, .1, .1, 1)
+theme1$plot.line$lwd <- 2
+theme1$strip.background$col <- rgb(.0, .2, .6, .2)
+trellis.par.set(theme1)
+
+
+featurePlot(training2, y, 
+            plot = "scatter", 
+            span = .5, 
+            labels = c("Predictors","Y"),
+            type = c("p", "smooth"),
+            layout = c(4, 2))
+```
+  
+
+```{r}
+
+
+par(mfrow=c(2,4))
+for(i in 1:39)
+{    plot(training2[,i], y, xlab = colnames(training2)[i], ylab="y")
+    abline(lm(y~(training2)[,i]), col="red")}
+```
+
+
+#### Linear Model
+
+
+```{r}
+LinearMod <- lm(avgscore ~ .,
+data = training)
+
+summary(LinearMod)
+```
+
+
+The adjusted R-square is 0.25 which is relatively low since it implies that only 25% of the variablity in average score is explained by the current model. 
+
+Significant predictors include:
+
+  1. sexM : student's sex
+  2. studytime: weekly study time
+  3. failures: number of past class failures
+  4. schoolsupyes:extra educational support
+  5. goout: going out with friends 
+
+
+  - In terms of interpretation, it seems that male students seem to have a generally better average exam score than female students, and those who study for a longer time also seem to have a generally better average score. Those who need school support tend to have lower average score than students who don't. Student who have higher number of past class failures are also more likely to have lower average class score in the current class. Lastly, students who are more likely to go out with friends are also more likely to have lower average score in exam.
+
+
+test error
+```{r}
+pred_lm <- predict(LinearMod, testing)
+mean((testing$avgscore - pred_lm)^2)
+```
+
+  
+#### Ridge REGRESSION
+
+
+```{r}
+set.seed(2761)
+cv.ridge <- cv.glmnet(training2, y,
+alpha = 0,
+lambda = exp(seq(0, 5, length = 100)))
+plot(cv.ridge)
+abline(h = (cv.ridge$cvm + cv.ridge$cvsd)[which.min(cv.ridge$cvm)], col = 4, lwd = 2)
+```
+choosing the best lambda
+```{r}
+# min CV MSE
+cv.ridge$lambda.min
+# the 1SE rule
+cv.ridge$lambda.1se
+```
+```{r}
+ridge_coe=predict(cv.ridge, s = "lambda.min", type = "coefficients")
+
+```
+
+plot: coefficient value versus lambda value
+```{r}
+plot_glmnet(cv.ridge$glmnet.fit)
+
+```
+
+
+From this plot we note higheryes ( student who wants to take higher education) and schoolsupyes ( extra educational support ) have the most impact on the outcome. Higheryes has positive coefficient meaning students who want to take higher education is a impactful predictor for average exam, and schholsupyes has negative coefficient meaning students who need extra educational support tend to have lower average exam score.
+
+Other important feature include:
+
+- positive coefficient: 
+  - fjobteacher ( father's job as 'teacher')) 
+  - famsizeL3 (family size  less or equal to 3)
+  - mjobhealth ( mother's job 'health' care related,)
+  - sexM (student's sex: male))
+  - guardianother ( student's guardian: other)
+  
+- negetive coefficient: 
+  - failures ( number of past class failures )
+  - famsupyes (family educational support:yes)
+  - romanticyes ( with a romantic relationshipLyes)
+  
+test error
+```{r}
+# make prediction
+ridge_pred=(predict(cv.ridge, newx = test2,
+s = "lambda.min", type = "response"))
+mean((ridge_pred - testing$avgscore)^2)
+```
+
+
+#### LASSO REGRESSION
+
+```{r}
+cv.lasso <- cv.glmnet(training2, y,
+alpha = 1,
+lambda = exp(seq(-3, 1, length = 100)))
+plot(cv.lasso)
+abline(h = (cv.lasso$cvm + cv.lasso$cvsd)[which.min(cv.lasso$cvm)], col = 4, lwd = 2)
+
+```
+chossing the best lambda 
+```{r}
+cv.lasso$lambda.min
+plot_glmnet(cv.lasso$glmnet.fit)
+```
+
+- Lasso produce similar result with ridge in that both regression model indicates vhigheryes,schoolsupyes,failures,famsupyes,romanticyes,SexM, gurdnthr, famsizLE3,fjobteacher as reletively more impactful coefficient.
+
+
+```{r}
+Lasso_coe=predict(cv.lasso, s = "lambda.min", type = "coefficients")
+
+```
+produce the coefficient that is not regularize into 0
+```{r}
+which(Lasso_coe[,1] != 0)
+```
+
+
+test error
+```{r}
+
+Lasso_pred=predict(cv.lasso, newx = test2, s = "lambda.min", type = "response")
+mean((Lasso_pred - testing$avgscore)^2)
+
+
+```
+
+
+
+#### comparing coefficient
+
+```{r}
+round(cbind(OLS = coef(LinearMod), 
+          ridge = ridge_coe,
+          lasso=Lasso_coe),4)
+```
+
+
+#### Comparing different models CV RMSE
+
+```{r, fig.width=5}
+ctrl1 <- trainControl(method = "repeatedcv", number = 10, repeats = 5)
+
+set.seed(2)
+lm.fit <- train(training2, y,
+                method = "lm",
+                trControl = ctrl1)
+
+
+lasso.fit <- train(training2, y,
+                   method = "glmnet",
+                   tuneGrid = expand.grid(alpha = 1, 
+                                          lambda = exp(seq(-3, 1, ength=100))),
+                   trControl = ctrl1)
+
+ridge.fit <- train(training2, y,
+                   method = "glmnet",
+                   tuneGrid = expand.grid(alpha = 0, 
+                                          lambda = exp(seq(0, 5, length=100))),
+                   # preProc = c("center", "scale"),
+                   trControl = ctrl1)
+
+resamp <- resamples(list(lasso = lasso.fit, ridge = ridge.fit, lm = lm.fit))
+summary(resamp)
+
+bwplot(resamp, metric = "RMSE")
+```
+
+  - When I compare the cross-validation RMSE between lm, lasso, and ridge regression model, we see that ridge model actually have lower RMSE mean and overall lower RMSE value comparing to lasso and lm. Lower RMSE means that the model have relatively smaller noise and was able to account for important features. 
